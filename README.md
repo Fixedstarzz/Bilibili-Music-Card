@@ -34,7 +34,7 @@
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展
 2. 下载或直接点击 [bilibili-music-card.user.js](bilibili-music-card.user.js)
-   （GitHub 页面也可用 raw 链接：`https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/bilibili-music-card.user.js`）
+   （GitHub 页面也可用 raw 链接：`https://raw.githubusercontent.com/Fixedstarzz/Bilibili-Music-Card/bilibili-music-card.user.js`）
 3. 油猴弹出安装页，点「安装」；从 GitHub raw 链接安装的脚本会自动跟踪仓库更新
 
 > 首次调用 B 站接口时 Tampermonkey 可能询问跨域权限（`api.bilibili.com`、
