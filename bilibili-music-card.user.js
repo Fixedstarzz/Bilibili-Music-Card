@@ -2,9 +2,9 @@
 // @name         Bilibili 音乐卡片
 // @name:en-US   Bilibili Music Card
 // @namespace    bmc.local
-// @version      1.0.0
-// @description  把 B 站视频链接变成歌单：悬浮音乐卡片后台播放，扫码登录 B 站账号，随机/顺序/单曲循环、音量与进度调节、封面模糊背景；默认仅在 B 站相关页面运行，其他页面可从油猴菜单临时启用。
-// @description:en-US Turn Bilibili video links into a playlist: a floating music card that plays audio in the background, with QR login, shuffle/sequence/loop, volume and seek controls, and a blurred-cover backdrop. Runs on Bilibili pages by default; other sites can be enabled temporarily from the userscript menu.
+// @version      1.1.0
+// @description  把 B 站视频链接变成歌单：悬浮音乐卡片后台播放，自动同步网页已登录的 B 站账号（也可扫码登录），随机/顺序/单曲循环、音量与进度调节、封面模糊背景；默认仅在 B 站相关页面运行，其他页面可从油猴菜单临时启用。
+// @description:en-US Turn Bilibili video links into a playlist: a floating music card that plays audio in the background, reusing the browser's Bilibili session (QR login as fallback), with shuffle/sequence/loop, volume and seek controls, and a blurred-cover backdrop. Runs on Bilibili pages by default; other sites can be enabled temporarily from the userscript menu.
 // @author       Fixedstarzz
 // @license      MIT
 // @icon         data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Crect%20width='24'%20height='24'%20rx='6'%20fill='%2316161c'/%3E%3Ccircle%20cx='9.5'%20cy='16'%20r='2.6'%20fill='%23fa2d48'/%3E%3Cpath%20d='M12.6%2016V7.4l5.2-1.2v2.6l-3.6.9V16z'%20fill='%23fff'/%3E%3C/svg%3E
@@ -328,8 +328,9 @@
   // 测试钩子：仅在本地台架/单测显式开启时暴露（油猴环境必有 GM_info，正式安装中不可达）
   if (typeof globalThis !== 'undefined' && globalThis.__BMC_EXPORT_QR__ && typeof GM_info === 'undefined') globalThis.BMC_QR = { encode: qrEncode, root: () => rootRef, safeImg, safeStream, isBiliPage, openPanel: () => openPanel(), addUrls: list => addUrls(list), removeUrl: i => removeUrl(i), reorderUrl: (a, b) => reorderUrl(a, b), openBig: () => openBig(), clearAll: () => clearAll() };
 
-  // ---------------- 登录凭证：本地缓存 + 过期检测 ----------------
-  // SESSDATA 存于脚本存储；启动/打开面板时用 nav 接口校验，过期即清除并要求重新扫码
+  // ---------------- 登录：网页登录态优先 + 本地扫码凭证 + 过期检测 ----------------
+  // 优先同步浏览器已登录的 B 站会话：GM 通道请求 B 站接口时自动附带该域会话 Cookie，脚本不读也不存凭证值；
+  // 未登录 / Cookie 不可达或被禁时回退扫码：SESSDATA 存于脚本存储，nav 接口校验，过期清除并要求重新扫码
   const NAV_URL = 'https://api.bilibili.com/x/web-interface/nav';
   const AUTH_TTL = 10 * 60e3; // 校验结果缓存时长
   let authCheckedAt = 0;
@@ -401,8 +402,10 @@
     a.ts = Date.now();
     S.set(K.auth, a);
     S.set(K.streams, {});   // 清空直链缓存，重新按账号取流
+    cfg.noBrowserAuth = false;   // 扫码登录即重新允许日后回退到网页登录态同步
+    S.set(K.cfg, cfg);
     if (data.url && isLoginCallback(data.url)) GM_xmlhttpRequest({ method: 'GET', url: data.url, timeout: 10000, onload: () => {}, onerror: () => {} });
-    checkAuth({ announce: true, force: true });
+    checkAuth({ announce: true, force: true, preferStored: true });   // 校验刚扫码的账号本身，不被网页会话抢占
   }
 
   // ---------------- Cookie 静默续期（refresh_token 流程） ----------------
@@ -439,49 +442,59 @@
     }, { auth: true });
   }
 
-  // opts: { announce: 校验成功时提示, expiryToast: 过期时提示, force: 跳过校验节流, cb: 回调 }
+  // opts: { announce: 校验成功时提示, expiryToast: 过期时提示, force: 跳过校验节流,
+  //        preferStored: 跳过网页探测直接校验刚扫码的账号, cb: 回调 }
   function checkAuth(opts) {
     opts = opts || {};
     const finish = () => { renderLoginUI(); if (opts.cb) opts.cb(); };
     if (!opts.force && authVerifiedRecently()) return finish();
     authCheckedAt = Date.now();
-    gmJSON(NAV_URL, {}, d => {
-      if (d && d.code === 0 && d.data && d.data.isLogin) {
-        applyAuth(d.data);
-        const a = authGet();
-        if (opts.announce) toast('登录成功：' + a.name);
-        // 临期主动续期：cookie/info 标记需要刷新时静默换新（24h 节流）
-        if (a.refreshToken && Date.now() - lastRefreshProbe > 24 * 60e3) {
-          lastRefreshProbe = Date.now();
-          gmJSON('https://passport.bilibili.com/x/passport-login/web/cookie/info', {}, dci => {
-            if (dci && dci.code === 0 && dci.data && dci.data.refresh === true) {
-              tryCookieRefresh(ok => { if (ok) toast('登录凭证已自动续期'); });
-            }
-          }, { auth: true });
+    // 第一优先：浏览器网页登录态（nav 裸请求，GM 通道自动附带 bilibili.com 会话 Cookie，脚本不读不存凭证值）
+    if (!opts.preferStored && !cfg.noBrowserAuth) {
+      gmJSON(NAV_URL, {}, d => {
+        if (d && d.code === 0 && d.data && d.data.isLogin) {
+          S.del(K.auth);   // 网页登录态优先且凭证不落地；顺带清除旧扫码凭证避免身份混淆
+          applyAuth(d.data);
+          if (opts.announce) toast('已同步网页登录：' + (authGet().name || ''));
+          return finish();
         }
-        return finish();
-      }
+        storedPath();   // 未登录 / Cookie 不可达或被禁 → 回退本地扫码凭证或扫码界面
+      }, {});
+      return;
+    }
+    storedPath();
+
+    // 第二优先：本地扫码凭证（带凭证校验该账号本身；失效先静默续期，失败才清除并回到扫码）
+    function storedPath() {
       const a = authGet();
-      if (a && a.sessdata) {
-        // 本地凭证优先：带 Cookie 校验；失效则先尝试静默续期，失败才要求重新扫码
-        gmJSON(NAV_URL, {}, d2 => {
-          if (d2 && d2.code === 0 && d2.data && d2.data.isLogin) {
-            applyAuth(d2.data);
-            if (opts.announce) toast('登录成功：' + a.name);
-            return finish();
+      if (!(a && a.sessdata)) return finish();
+      gmJSON(NAV_URL, {}, d => {
+        if (d && d.code === 0 && d.data && d.data.isLogin) {
+          applyAuth(d.data);
+          if (opts.announce) toast('登录成功：' + a.name);
+          // 临期主动续期：cookie/info 标记需要刷新时静默换新（24h 节流）
+          if (a.refreshToken && Date.now() - lastRefreshProbe > 24 * 60e3) {
+            lastRefreshProbe = Date.now();
+            gmJSON('https://passport.bilibili.com/x/passport-login/web/cookie/info', {}, dci => {
+              if (dci && dci.code === 0 && dci.data && dci.data.refresh === true) {
+                tryCookieRefresh(ok => { if (ok) toast('登录凭证已自动续期'); });
+              }
+            }, { auth: true });
           }
-          tryCookieRefresh(renewed => {
-            if (!renewed) { S.del(K.auth); if (opts.expiryToast) toast('登录已过期，请重新扫码'); return finish(); }
-            gmJSON(NAV_URL, {}, d3 => {
-              if (d3 && d3.code === 0 && d3.data && d3.data.isLogin) { applyAuth(d3.data); finish(); }
-              else { S.del(K.auth); if (opts.expiryToast) toast('登录已过期，请重新扫码'); finish(); }
-            }, {});
-          });
-        }, { auth: true });
-        return;
-      }
-      finish();
-    }, {});
+          return finish();
+        }
+        tryCookieRefresh(renewed => {
+          const recheck = () => gmJSON(NAV_URL, {}, d3 => {
+            if (d3 && d3.code === 0 && d3.data && d3.data.isLogin) { applyAuth(d3.data); return finish(); }
+            S.del(K.auth);
+            if (opts.expiryToast) toast('登录已过期，请重新扫码');
+            finish();
+          }, { auth: true });
+          if (renewed) recheck();
+          else { S.del(K.auth); if (opts.expiryToast) toast('登录已过期，请重新扫码'); finish(); }
+        });
+      }, { auth: true });
+    }
   }
 
   function applyAuth(data) {
@@ -496,6 +509,7 @@
   function logout() {
     S.del(K.auth);
     cfg.loginSkip = false;
+    cfg.noBrowserAuth = true;   // 退出后不再自动同步网页登录态；重新扫码登录可再次启用
     S.set(K.cfg, cfg);
     toast('已退出登录');
     renderLoginUI();
@@ -510,7 +524,7 @@
     loginOff.hidden = logged || !cfg.loginSkip;
     if (logged) {
       loginStop();
-      loginName.textContent = a.name || ('账号 ' + (a.dedeUserId || ''));
+      loginName.textContent = (a.name || ('账号 ' + (a.dedeUserId || ''))) + (a.sessdata ? '' : ' · 网页登录');
       if (a.face) { loginFace.src = a.face; loginFace.hidden = false; } else loginFace.hidden = true;
     } else if (!cfg.loginSkip) {
       loginStart();
@@ -531,6 +545,7 @@
       my: c.my != null && isFinite(+c.my) ? +c.my : null,
       mini: !!c.mini,
       loginSkip: !!c.loginSkip,
+      noBrowserAuth: !!c.noBrowserAuth,   // 退出登录后置位：不再自动同步网页登录态
       confine: c.confine !== false,   // 默认策略：仅 B 站相关页面运行
       opacity: +c.opacity >= 0.3 && +c.opacity <= 1 ? +c.opacity : 1
     };
@@ -569,7 +584,7 @@
     const sc = S.get(K.streams, {});
     const hit = sc[t.cid];
     if (hit && hit.url && Date.now() - hit.ts < STREAM_TTL) return cb(hit.url);
-    // 本地凭证优先；若带凭证取流失败（如凭证过期），自动退回匿名重试一次
+    // 网页登录态/本地凭证优先；若带凭证取流失败（如凭证过期），自动退回无凭证重试一次
     const attempt = useAuth => gmJSON('https://api.bilibili.com/x/player/playurl', { bvid: t.bvid, cid: t.cid, fnval: 16, platform: 'pc' }, (d, err) => {
       if (err) return useAuth ? attempt(false) : fail(err);
       if (!d || !d.data) return useAuth ? attempt(false) : fail(apiMsg(d));
@@ -2079,8 +2094,8 @@ input[type=range]::-moz-range-thumb{width:10px;height:10px;border:0;border-radiu
     pOp.value = Math.round(cfg.opacity * 100);
     pOpV.textContent = pOp.value;
     if (updOpDot) updOpDot();
-    // 本地凭证过期检测（节流；失效自动清除并回到扫码界面）
-    if (authGet() && !authVerifiedRecently()) checkAuth({ expiryToast: true });
+    // 登录态校验（节流）：未同步过则先探测网页登录态，回退本地扫码凭证；失效自动清除并回到扫码界面
+    if (!authVerifiedRecently()) checkAuth({ expiryToast: !!authGet() });
     renderQuick();
     updateHint();
     renderList();
@@ -2194,7 +2209,7 @@ input[type=range]::-moz-range-thumb{width:10px;height:10px;border:0;border-radiu
     const hb = S.get(K.hb);
     if (hb && hb.id && Date.now() - hb.ts < STALE_MS) becomeRemote();
     else tryClaim(true);
-    if (authGet()) checkAuth();   // 启动时优先使用本地凭证，静默校验是否过期
+    checkAuth();   // 启动即探测登录：先网页登录态（自动同步），回退本地扫码凭证
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('打开播放列表 / 设置', openPanel);
       GM_registerMenuCommand('扫码登录 B 站', openPanel);
